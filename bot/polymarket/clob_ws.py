@@ -70,9 +70,13 @@ class TickSizeChangeEvent:
     new_tick_size: float
 
 
-WSEvent = (
-    BookSnapshotEvent | PriceChangeEvent | TradeEvent | TickSizeChangeEvent
-)
+from typing import Union
+
+# Type alias - Union zamiast `|` żeby działało w Pythonie 3.9
+# (`X | Y` jako runtime expression wymaga 3.10+; w produkcji Docker ma 3.11)
+WSEvent = Union[
+    BookSnapshotEvent, PriceChangeEvent, TradeEvent, TickSizeChangeEvent,
+]
 
 
 # -----------------------------------------------------------------------------

@@ -53,6 +53,37 @@ monitored_prices:
 alert_cooldown_seconds: 300
 
 
+# Konsolidacja alertów per event - "okno agregacji".
+# Pierwszy alert dla danego eventu startuje timer N sekund. Wszystkie kolejne
+# alerty z tego samego eventu w trakcie okna są dorzucane do listy. Po N
+# sekundach idzie JEDNA wiadomość ze wszystkimi alertami (sortowanie
+# podrynków wg progu malejąco).
+# UWAGA: timer NIE jest resetowany przez kolejne alerty.
+# Burst-drop (alert A z spadkiem >5k shares) omija ten bufor i leci od razu.
+aggregation_window_seconds: 30
+
+
+# Filtr "bid support" - wycisza alerty na podrynkach które nie mają
+# wsparcia w księdze zleceń (brak bidów na podanej cenie).
+#
+# Dla każdego alertu (A/B/C/D oraz burst-drop) sprawdzamy czy po stronie
+# alertu (YES albo NO) na BIDZIE (limit buy) na cenie DOKŁADNIE
+# `required_price` jest co najmniej `min_total_shares` shares.
+#   - jeśli TAK -> alert leci normalnie do bufora konsolidacji / burst-drop
+#   - jeśli NIE -> alert wyciszony, log INFO ("Alert wyciszony (brak bid support)")
+#
+# Sens: jeśli rynek na 99.9¢ NIE ma realnego buy wall-a kawałek pod ceną,
+# alert jest mało znaczący / fałszywy. Filtr eliminuje szum.
+bid_support_filter:
+  # Globalny włącznik. false = filtr nie działa, wszystkie alerty lecą.
+  enabled: true
+  # Cena bidu którą sprawdzamy - DOKŁADNIE ta wartość (nie suma poziomów).
+  # Format ułamka 0.0-1.0 (jak `monitored_prices`). 0.997 = 99.7¢.
+  required_price: 0.997
+  # Minimalna suma shares na bidzie na required_price. 1 = "cokolwiek".
+  min_total_shares: 1
+
+
 # Bot monitoruje TYLKO eventy zamykające się w ciągu tylu godzin.
 # (24 = sprawdzaj tylko eventy które kończą się w ciągu doby)
 monitor_hours_before_close: 24

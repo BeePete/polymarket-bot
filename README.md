@@ -43,6 +43,123 @@ Z **cooldownem** 5 minut między alertami tego samego typu dla tego samego
 rynku — żeby nie zalewać spamu. Wyjątek: alert A z spadkiem o > 5,000
 shares wysyła się natychmiast, ignorując cooldown.
 
+### Konsolidacja per event (debounce 30s)
+
+Zamiast wysyłać każdy alert osobno (5 alertów = 5 wiadomości), bot **agreguje
+alerty z tego samego eventu** w 30-sekundowym oknie i wysyła **jedną
+skonsolidowaną wiadomość**. Dzięki temu jeśli kilka podrynków eventu
+"Bitcoin Above ___" odpali alerty naraz, dostajesz jedną czytelną
+wiadomość zamiast 5 powiadomień pod rząd.
+
+- Pierwszy alert dla eventu startuje timer **30 s** (parametr
+  `aggregation_window_seconds`).
+- Kolejne alerty dla **tego samego eventu** w trakcie okna → dorzucane do
+  listy. **Timer NIE jest resetowany** — żeby okno nie rozjeżdżało się
+  w nieskończoność.
+- Po 30 s → **jedna wiadomość** ze wszystkimi zebranymi alertami,
+  posortowanymi malejąco po wartości progu (najwyższe `$XX,XXX` na górze).
+
+#### Wyjątek: burst-drop instant
+
+Alert A z spadkiem >5,000 shares **omija bufor** i leci natychmiast jako
+osobna wiadomość — żeby nie tracić informacji o kluczowym, gwałtownym
+ruchu na rynku. Bufor dla tego eventu pracuje dalej niezależnie.
+
+### Format wiadomości
+
+**Skonsolidowana** (najczęstsza):
+
+```
+₿ Bitcoin Above ___ on May 6
+
+🔻 $90,000 NO 99,9¢ — pozostało 25k (↓ 8k)
+🔻 $86,000 NO 99,9¢ — pozostało 28k (↓ 5k)
+🔻 $80,000 NO 99,8¢ — pozostało 22k (↓ 12k)
+
+https://polymarket.com/event/bitcoin-above-on-may-6
+🕒 14:23
+```
+
+**Burst-drop** (gwałtowny spadek, instant):
+
+```
+₿ Bitcoin Above ___ on May 6
+
+🔻 $86,000 NO 99,9¢ — pozostało 22k (↓ 13k)
+
+https://polymarket.com/event/bitcoin-above-on-may-6
+
+⚡ Burst-drop — alert poza cooldownem
+🕒 14:23
+```
+
+#### Mapowania w wiadomości
+
+- **Ikona w nagłówku** zależy od slug-a eventu:
+  - `bitcoin-*` / `btc-*` → **₿**
+  - `ethereum-*` / `eth-*` → **Ξ**
+  - `sp-500-*` / `s-and-p-*` → **📈**
+  - inne → **🎯**
+
+- **Emoji typu alertu** w linii podrynku:
+  - **🔻** A — Ask topnieje
+  - **💰** B — Duży market buy
+  - **📤** C — Nowy sell order
+  - **🛑** D — Duży limit buy ("rynek zamknięty")
+
+- **Skrót podrynku** — wyłuskany z tytułu (`Will Bitcoin reach $86,000` →
+  `$86,000`). Jeśli tytuł nie ma kwoty dolarowej, truncate do 40 znaków.
+
+- **Cena** w polskiej notacji z przecinkiem: `99,9¢` zamiast `99.9¢`.
+
+- **Liczby udziałów** skracane:
+  - `<1000` → `516`
+  - `1k–10k` → `5.5k`, `9.9k`
+  - `10k–1M` → `30k`, `123k`
+  - `≥1M` → `1.2M`
+
+### Filtr "bid support"
+
+Niektóre alerty są mało znaczące, jeśli pod ceną rynkową **NIE ma
+żadnego buy wall-a** (kupujących z limit orderem). Bot ma to wycinać
+filtrem **bid support**:
+
+> Każdy alert (A/B/C/D + burst-drop) jest puszczany dalej **tylko jeśli**
+> po stronie alertu (YES albo NO) na BIDZIE na cenie **dokładnie 99,7¢**
+> jest co najmniej **1 share**. Inaczej — alert jest wyciszony i
+> zalogowany jako INFO.
+
+**Przykład:**
+- Alert na "Bitcoin reach $86,000" NO 99,9¢: ask topnieje do 25k.
+- Sprawdzamy book NO: czy na bidzie 99,7¢ ktoś chce kupić ≥ 1 share?
+  - **TAK** (np. 100 shares) → alert leci do bufora konsolidacji.
+  - **NIE** (0 shares na 99,7¢, choćby były bidy na 99,8¢) → wyciszony.
+
+Filtr jest konfigurowalny w `config.yaml`:
+
+```yaml
+bid_support_filter:
+  enabled: true              # globalny włącznik
+  required_price: 0.997      # 99,7¢ jako ułamek
+  min_total_shares: 1        # minimalna suma shares na required_price
+```
+
+**Tuning** — po tygodniu sprawdź ile alertów filtr wyciszył:
+
+```bash
+docker compose logs --since 7d | grep "Alert wyciszony"
+```
+
+Format wpisu w logach (per wyciszenie):
+
+```
+INFO | Alert wyciszony (brak bid support) | event=bitcoin-may-7
+       market=$86,000 side=NO alert_type=A price_cents=99.7 shares=0
+```
+
+Jeśli filtr wycisza za dużo — zwiększ `required_price` (np. `0.996`)
+albo wyłącz przez `enabled: false`.
+
 ---
 
 ## 🤖 Część 1: Stworzenie bota Telegram

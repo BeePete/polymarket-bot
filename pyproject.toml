@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Tryb auto: każda funkcja `async def` w testach jest traktowana jako
+# pytest-asyncio test bez potrzeby dekoratora.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -60,6 +60,21 @@ class ThresholdsConfig(BaseModel):
     big_limit_buy_min_size: int = 19000
 
 
+class BidSupportFilterConfig(BaseModel):
+    """
+    Sekcja `bid_support_filter` - wycisza alerty na podrynkach które nie
+    mają wsparcia w księdze zleceń (brak bidów na podanej cenie).
+    """
+
+    enabled: bool = True
+    # Cena bidu którą sprawdzamy w formacie ułamka 0.0-1.0 (spójne z
+    # `monitored_prices`). Domyślnie 0.997 = 99.7¢.
+    required_price: float = 0.997
+    # Minimalna suma shares na bidzie na required_price.
+    # Domyślnie 1 = "cokolwiek".
+    min_total_shares: float = 1.0
+
+
 class AdvancedConfig(BaseModel):
     """Sekcja `advanced` - URL-e i parametry techniczne."""
 
@@ -79,6 +94,10 @@ class BotConfig(BaseModel):
     thresholds: ThresholdsConfig = Field(default_factory=ThresholdsConfig)
     monitored_prices: list[float] = Field(default_factory=lambda: [0.998, 0.999])
     alert_cooldown_seconds: int = 300
+    aggregation_window_seconds: int = 30      # debounce per event
+    bid_support_filter: BidSupportFilterConfig = Field(
+        default_factory=BidSupportFilterConfig,
+    )
     monitor_hours_before_close: int = 24
     discovery_interval_seconds: int = 1800
     rescan_interval_seconds: int = 30

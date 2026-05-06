@@ -27,13 +27,19 @@ from typing import Any
 from loguru import logger
 from telegram.ext import Application
 
+from .alerts.bid_support import BidSupportResult, check_bid_support
+from .alerts.buffer import AlertBuffer, BufferedAlert
 from .alerts.detector import (
     Alert,
     Detector,
     DetectorThresholds,
     resolve_side,
 )
-from .alerts.formatter import format_alert
+from .alerts.formatter import (
+    format_burst_drop_message,
+    format_consolidated_message,
+    market_short,
+)
 from .config import BotConfig, load_config
 from .polymarket.clob_ws import (
     BookSnapshotEvent,
@@ -87,7 +93,22 @@ def setup_logging(level: str) -> None:
 
 
 class Orchestrator:
-    """Konsument zdarzeń z kolejki WebSocketa - serce alertowania."""
+    """
+    Konsument zdarzeń z kolejki WebSocketa - serce alertowania.
+
+    Pipeline (po wprowadzeniu konsolidacji per event):
+        WS event -> detector -> alert(s)
+                                 |
+        +------- A z bypass_cooldown=True (burst-drop)
+        |          -> format_burst_drop_message -> sender INSTANT
+        |
+        +------- inne alerty
+                   -> cooldown gate (db.last_alert_at)
+                   -> AlertBuffer.add(event_slug, alert, market_question)
+                   -> (po aggregation_window_seconds)
+                   -> _on_buffer_flush(slug, alerts)
+                   -> format_consolidated_message -> sender
+    """
 
     def __init__(
         self,
@@ -96,12 +117,14 @@ class Orchestrator:
         ws: CLOBWebSocketManager,
         detector: Detector,
         sender: TelegramSender,
+        buffer: AlertBuffer,
     ):
         self.config = config
         self.db = db
         self.ws = ws
         self.detector = detector
         self.sender = sender
+        self.buffer = buffer
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -201,28 +224,95 @@ class Orchestrator:
             await self._maybe_send(alert, market)
 
     # -------------------------------------------------------------------------
-    # Cooldown + wysyłka
+    # Routing: bid_support filter / burst-drop / cooldown / bufor
     # -------------------------------------------------------------------------
 
-    async def _maybe_send(self, alert: Alert, market: Any) -> None:
-        # Cooldown - chyba że alert ma bypass (burst-drop dla A)
-        if not alert.bypass_cooldown:
-            last = self.db.last_alert_at(alert.alert_type, alert.token_id)
-            if last:
-                age = int(time.time()) - last
-                if age < self.config.alert_cooldown_seconds:
-                    logger.debug(
-                        f"Alert {alert.alert_type} dla {alert.token_id[:10]}... "
-                        f"w cooldownie ({age}s/{self.config.alert_cooldown_seconds}s)"
-                    )
-                    return
-
-        message = format_alert(
-            alert=alert,
-            market_question=market["question"] or "?",
-            event_slug=market["event_slug"] or "",
+    def _bid_support_check(self, alert: Alert) -> BidSupportResult | None:
+        """
+        Sprawdza filtr bid_support dla alertu. Zwraca:
+          - None  -> filtr wyłączony, alert może iść
+          - BidSupportResult z has_support=True  -> alert może iść
+          - BidSupportResult z has_support=False -> alert wyciszony
+        """
+        f = self.config.bid_support_filter
+        if not f.enabled:
+            return None
+        book = self.ws.get_book(alert.token_id)
+        return check_bid_support(
+            order_book=book,
+            side=alert.side,
+            required_price=f.required_price,
+            min_shares=f.min_total_shares,
         )
 
+    def _log_silenced(
+        self,
+        alert: Alert,
+        market: Any,
+        result: BidSupportResult,
+    ) -> None:
+        """Log INFO w ustalonym formacie spec'a."""
+        event_slug = market["event_slug"] or "?"
+        market_q = market_short(market["question"] or "?")
+        price_cents = result.required_price * 100
+        logger.info(
+            f"Alert wyciszony (brak bid support) | "
+            f"event={event_slug} market={market_q} side={alert.side} "
+            f"alert_type={alert.alert_type} price_cents={price_cents:.1f} "
+            f"shares={result.shares_at_price:g}"
+        )
+
+    async def _maybe_send(self, alert: Alert, market: Any) -> None:
+        market_question = market["question"] or "?"
+        event_slug = market["event_slug"] or ""
+
+        # 0) Filtr bid_support - PRZED wszystkim innym (burst, cooldown, buffer).
+        #    Wyciszony alert nie zajmuje miejsca w buforze.
+        bid_check = self._bid_support_check(alert)
+        if bid_check is not None and not bid_check.has_support:
+            self._log_silenced(alert, market, bid_check)
+            return
+
+        # 1) Burst-drop (alert A z bypass) - omija cooldown I bufor.
+        #    Wysyłka natychmiastowa, osobna wiadomość.
+        if alert.bypass_cooldown:
+            await self._send_burst_drop(alert, market_question, event_slug, market)
+            return
+
+        # 2) Cooldown gate - per (alert_type, token_id), trzymamy w DB.
+        last = self.db.last_alert_at(alert.alert_type, alert.token_id)
+        if last:
+            age = int(time.time()) - last
+            if age < self.config.alert_cooldown_seconds:
+                logger.debug(
+                    f"Alert {alert.alert_type} dla {alert.token_id[:10]}... "
+                    f"w cooldownie ({age}s/{self.config.alert_cooldown_seconds}s)"
+                )
+                return
+
+        # 3) Cooldown przeszedł - wpada do bufora konsolidacji per event.
+        #    Wysyłka i record_alert dzieją się dopiero po flushu.
+        await self.buffer.add(event_slug, alert, market_question)
+        logger.debug(
+            f"Alert {alert.alert_type} ({market_question[:40]}/{alert.side}) "
+            f"-> bufor '{event_slug}'"
+        )
+
+    async def _send_burst_drop(
+        self,
+        alert: Alert,
+        market_question: str,
+        event_slug: str,
+        market: Any,
+    ) -> None:
+        """Burst-drop A: instant, bez bufora."""
+        event_title = self._event_title(event_slug)
+        message = format_burst_drop_message(
+            alert=alert,
+            market_question=market_question,
+            event_title=event_title,
+            event_slug=event_slug,
+        )
         ok = await self.sender.send_html(message)
         if ok:
             self.db.record_alert(
@@ -232,9 +322,51 @@ class Orchestrator:
                 payload=alert.payload,
             )
             logger.info(
-                f"📨 Alert {alert.alert_type} wysłany "
-                f"({market['question'][:40]} / {alert.side})"
+                f"⚡ Burst-drop {alert.alert_type} wysłany "
+                f"({market_question[:40]} / {alert.side})"
             )
+
+    async def on_buffer_flush(
+        self, event_slug: str, buffered: list[BufferedAlert],
+    ) -> None:
+        """
+        Callback wywoływany przez AlertBuffer po upłynięciu okna agregacji.
+        Składa skonsolidowaną wiadomość i wysyła.
+        """
+        if not buffered:
+            return
+        event_title = self._event_title(event_slug)
+        alerts_with_questions = [(b.alert, b.market_question) for b in buffered]
+        message = format_consolidated_message(
+            alerts_with_questions=alerts_with_questions,
+            event_title=event_title,
+            event_slug=event_slug,
+        )
+        ok = await self.sender.send_html(message)
+        if ok:
+            for b in buffered:
+                market = self.db.get_market_by_token(b.alert.token_id)
+                condition_id = market["condition_id"] if market else None
+                self.db.record_alert(
+                    alert_type=b.alert.alert_type,
+                    token_id=b.alert.token_id,
+                    condition_id=condition_id,
+                    payload=b.alert.payload,
+                )
+            types_summary = "/".join(b.alert.alert_type for b in buffered)
+            logger.info(
+                f"📨 Wiadomość skonsolidowana wysłana "
+                f"(event='{event_slug}', {len(buffered)} alertów: {types_summary})"
+            )
+
+    def _event_title(self, event_slug: str) -> str:
+        """Pobiera ładny tytuł eventu z bazy; fallback do slug-a."""
+        if not event_slug:
+            return "?"
+        row = self.db.get_event(event_slug)
+        if row and row["title"]:
+            return row["title"]
+        return event_slug
 
 
 # =============================================================================
@@ -357,7 +489,15 @@ async def main_async() -> None:
         sender.pause()
         logger.info("Bot wystartował w trybie PAUSE (z poprzedniego wyłączenia)")
 
-    orchestrator = Orchestrator(config, db, ws, detector, sender)
+    # Bufor konsolidacji per event - debounce timer.
+    # Lambda jest leniwa: 'orchestrator' jest sprawdzane dopiero przy
+    # pierwszym wywołaniu (po >= aggregation_window_seconds od pierwszego
+    # alertu), a do tego czasu zmienna już istnieje (linia niżej).
+    buffer = AlertBuffer(
+        window_seconds=config.aggregation_window_seconds,
+        on_flush=lambda slug, alerts: orchestrator.on_buffer_flush(slug, alerts),
+    )
+    orchestrator = Orchestrator(config, db, ws, detector, sender, buffer)
     scheduler = DiscoveryScheduler(config, db, ws)
 
     # Re-subskrypcja: przy starcie odczytaj wszystkie znane tokeny z DB
@@ -442,6 +582,13 @@ async def main_async() -> None:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Flush pending bufora (alerty czekające na wysłanie) - przed
+        # zamknięciem Telegrama, żeby się rzeczywiście wysłały.
+        try:
+            await buffer.shutdown()
+        except Exception as exc:
+            logger.warning(f"Błąd przy zamykaniu bufora: {exc!r}")
 
         try:
             await tg_app.updater.stop()
