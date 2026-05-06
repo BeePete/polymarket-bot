@@ -892,6 +892,172 @@ class TestAlertBuffer:
 
 
 # -----------------------------------------------------------------------------
+# AlertBuffer - DEDUPLIKACJA per (token_id, alert_type)
+# -----------------------------------------------------------------------------
+
+
+class TestAlertBufferDeduplication:
+    """
+    Bug fix: bufor wysyłał ten sam alert wielokrotnie w jednej wiadomości
+    skonsolidowanej. Po fix: w obrębie jednego okna deduplikujemy po
+    (token_id, alert_type) - max 1 wpis per (podrynek + strona + typ).
+    """
+
+    async def test_5_alertow_A_dla_tego_samego_tokena_jeden_wpis(self):
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.05, on_flush=rec)
+
+        # 5 alertów A dla TEGO SAMEGO tokena - wartości się zmieniają
+        for ask_sum in (28000, 25000, 22000, 18000, 15000):
+            await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                          {"ask_sum": ask_sum, "previous_sum": 33000},
+                          token_id="TOK_83k_NO"), "Bitcoin $83,000")
+
+        await _asyncio.sleep(0.10)
+
+        assert len(rec.calls) == 1
+        slug, alerts = rec.calls[0]
+        # KLUCZOWE: tylko 1 wpis pomimo 5 add'ów
+        assert len(alerts) == 1
+        # I to z NAJNOWSZYMI wartościami (ostatnia wartość: 15000)
+        assert alerts[0].alert.payload["ask_sum"] == 15000
+
+    async def test_alert_A_i_D_dla_tego_samego_tokena_dwa_wpisy(self):
+        """Różne typy alertu = osobne wpisy (nie deduplikujemy across types)."""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.05, on_flush=rec)
+
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 25000}, token_id="TOK_83k_NO"),
+                      "Bitcoin $83,000")
+        await buf.add("ev-btc", make_alert("D", "NO", 0.998,
+                      {"old_size": 0, "new_size": 25000, "delta": 25000},
+                      token_id="TOK_83k_NO"),
+                      "Bitcoin $83,000")
+
+        await _asyncio.sleep(0.10)
+
+        slug, alerts = rec.calls[0]
+        types = sorted(a.alert.alert_type for a in alerts)
+        assert types == ["A", "D"]
+        assert len(alerts) == 2
+
+    async def test_3_podrynki_kazdy_po_10_razy_trzy_wpisy(self):
+        """Spec: alerty dla 3 różnych podrynków, każdy po 10 razy → 3 wpisy."""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.05, on_flush=rec)
+
+        # 10x ten sam alert dla każdego z 3 podrynków
+        for _ in range(10):
+            await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                          {"ask_sum": 25000}, token_id="TOK_83k_NO"),
+                          "Bitcoin $83,000")
+            await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                          {"ask_sum": 18000}, token_id="TOK_85k_NO"),
+                          "Bitcoin $85,000")
+            await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                          {"ask_sum": 12000}, token_id="TOK_88k_NO"),
+                          "Bitcoin $88,000")
+
+        await _asyncio.sleep(0.10)
+
+        slug, alerts = rec.calls[0]
+        # 30 add'ów -> 3 unikalne wpisy
+        assert len(alerts) == 3
+        # Każdy podrynek reprezentowany dokładnie raz
+        token_ids = sorted(a.alert.token_id for a in alerts)
+        assert token_ids == ["TOK_83k_NO", "TOK_85k_NO", "TOK_88k_NO"]
+
+    async def test_dedup_per_side_yes_i_no_osobno(self):
+        """YES i NO tego samego rynku to osobne wpisy (różne token_id)."""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.05, on_flush=rec)
+
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 11000}, token_id="TOK_83k_NO"),
+                      "Bitcoin $83,000")
+        await buf.add("ev-btc", make_alert("A", "YES", 0.999,
+                      {"ask_sum": 4600}, token_id="TOK_83k_YES"),
+                      "Bitcoin $83,000")
+
+        await _asyncio.sleep(0.10)
+
+        slug, alerts = rec.calls[0]
+        sides = sorted(a.alert.side for a in alerts)
+        assert sides == ["NO", "YES"]
+        assert len(alerts) == 2
+
+    async def test_aktualizacja_zachowuje_najnowsze_wartosci(self):
+        """Spec: 'Aktualizuj istniejący wpis najnowszymi wartościami
+        (current depth, drop, itd.)'"""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.05, on_flush=rec)
+
+        # Pierwszy alert - ask_sum 28k, drop 5k
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 28000, "previous_sum": 33000},
+                      token_id="TOK1"), "Bitcoin $83,000 v1")
+        # Drugi alert - ask_sum 22k, drop 11k (świeższe wartości)
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 22000, "previous_sum": 33000},
+                      token_id="TOK1"), "Bitcoin $83,000 v2")
+
+        await _asyncio.sleep(0.10)
+
+        slug, alerts = rec.calls[0]
+        assert len(alerts) == 1
+        # NAJNOWSZE wartości - z drugiego add'a
+        assert alerts[0].alert.payload["ask_sum"] == 22000
+        # market_question też najnowsze
+        assert alerts[0].market_question == "Bitcoin $83,000 v2"
+
+    async def test_dedup_nie_resetuje_timera(self):
+        """Aktualizacja istniejącego wpisu NIE może resetować timera flush."""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.10, on_flush=rec)
+
+        # t=0: pierwszy alert, timer startuje (flush za 100ms)
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 28000}, token_id="TOK1"), "Bitcoin $83,000")
+
+        # t=80ms: aktualizacja (dedup) - JEŚLI resetowałby timer, flush byłby
+        # za kolejne 100ms (czyli t=180ms). Sprawdzimy że flush nastąpił do
+        # t~110ms.
+        await _asyncio.sleep(0.08)
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 22000}, token_id="TOK1"), "Bitcoin $83,000")
+
+        # t=130ms: flush już powinien się wydarzyć (timer NIE zresetowany)
+        await _asyncio.sleep(0.05)
+        assert len(rec.calls) == 1
+
+    async def test_dedup_zachowuje_oryginalny_detected_at(self):
+        """detected_at zachowane przy aktualizacji - do tie-breakera."""
+        rec = FlushRecorder()
+        buf = AlertBuffer(window_seconds=0.10, on_flush=rec)
+
+        # Najpierw dodaj alert dla TOK1 (older)
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 25000}, token_id="TOK1"), "$83,000")
+        await _asyncio.sleep(0.02)
+        # Potem TOK2 (newer)
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 20000}, token_id="TOK2"), "$83,000")
+        await _asyncio.sleep(0.02)
+        # Aktualizuj TOK1 - detected_at TOK1 powinien być nadal STARSZY niż TOK2
+        await buf.add("ev-btc", make_alert("A", "NO", 0.999,
+                      {"ask_sum": 18000}, token_id="TOK1"), "$83,000 updated")
+
+        await _asyncio.sleep(0.15)
+        slug, alerts = rec.calls[0]
+        assert len(alerts) == 2
+        tok1 = next(a for a in alerts if a.alert.token_id == "TOK1")
+        tok2 = next(a for a in alerts if a.alert.token_id == "TOK2")
+        # TOK1 wykryty jako pierwszy, więc jego detected_at < detected_at TOK2
+        assert tok1.detected_at < tok2.detected_at
+
+
+# -----------------------------------------------------------------------------
 # check_bid_support - filtr "bid support"
 # -----------------------------------------------------------------------------
 

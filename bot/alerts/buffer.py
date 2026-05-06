@@ -70,24 +70,47 @@ class AlertBuffer:
     # API publiczne
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _dedup_key(alert: Alert) -> tuple[str, str]:
+        """
+        Klucz deduplikacji w obrębie jednego okna bufora:
+            (token_id, alert_type)
+        Funkcjonalnie equivalent (market_id, side, alert_type) z spec —
+        bo token_id jednoznacznie identyfikuje (market_id, side):
+        każdy market ma 2 tokeny (YES i NO), każdy ma unikalne token_id.
+
+        Dwa alerty z TYM SAMYM kluczem -> ten sam wpis w wiadomości
+        (najnowsze wartości nadpisują poprzednie).
+        Różne typy dla tego samego token (np. A i D) -> dwa OSOBNE wpisy.
+        """
+        return (alert.token_id, alert.alert_type)
+
     async def add(
         self,
         event_slug: str,
         alert: Alert,
         market_question: str,
     ) -> None:
-        """Dodaje alert do bufora dla event_slug; startuje timer jeśli pierwszy."""
+        """
+        Dodaje alert do bufora dla event_slug; startuje timer jeśli pierwszy.
+
+        DEDUPLIKACJA: jeśli w buforze jest już wpis o tym samym kluczu
+        (token_id, alert_type) - aktualizujemy go najnowszymi wartościami
+        zamiast dodawać nowy. Zapobiega to zalewaniu wiadomości tym samym
+        wpisem powtórzonym N razy (np. gdy alert A dla $83k NO odpala się
+        15 razy w ciągu 30s - chcemy 1 wpis z najnowszą głębokością ask).
+        """
         if self._shutting_down:
             logger.debug("AlertBuffer: shutdown - pomijam add()")
             return
 
         async with self._lock:
-            buffered = BufferedAlert(
-                alert=alert, market_question=market_question,
-            )
             existing = self._buffers.get(event_slug)
             if existing is None:
                 # Pierwszy alert dla tego eventu - twórz bufor + timer
+                buffered = BufferedAlert(
+                    alert=alert, market_question=market_question,
+                )
                 self._buffers[event_slug] = [buffered]
                 self._tasks[event_slug] = asyncio.create_task(
                     self._flush_after_delay(event_slug),
@@ -97,13 +120,36 @@ class AlertBuffer:
                     f"AlertBuffer: nowy bufor dla '{event_slug}' "
                     f"(flush za {self.window_seconds}s)"
                 )
-            else:
-                # Kolejny alert w oknie - DORZUĆ, timer NIE resetowany
-                existing.append(buffered)
-                logger.debug(
-                    f"AlertBuffer: dodano alert {alert.alert_type} do bufora "
-                    f"'{event_slug}' (size={len(existing)})"
-                )
+                return
+
+            # Bufor już istnieje - sprawdź czy mamy duplikat (po kluczu)
+            key = self._dedup_key(alert)
+            for i, b in enumerate(existing):
+                if self._dedup_key(b.alert) == key:
+                    # DUPLIKAT - nadpisz najnowszymi wartościami,
+                    # ale ZACHOWAJ oryginalny detected_at (do tie-breakera
+                    # przy sortowaniu - wpis logicznie istnieje od pierwszego
+                    # wykrycia, tylko z świeższymi danymi).
+                    existing[i] = BufferedAlert(
+                        alert=alert,
+                        market_question=market_question,
+                        detected_at=b.detected_at,
+                    )
+                    logger.debug(
+                        f"AlertBuffer: zaktualizowano duplikat alertu "
+                        f"{alert.alert_type} dla token={alert.token_id[:10]}... "
+                        f"w buforze '{event_slug}' (size={len(existing)})"
+                    )
+                    return
+
+            # Brak duplikatu - dorzuć nowy wpis. Timer NIE jest resetowany.
+            existing.append(BufferedAlert(
+                alert=alert, market_question=market_question,
+            ))
+            logger.debug(
+                f"AlertBuffer: dodano alert {alert.alert_type} do bufora "
+                f"'{event_slug}' (size={len(existing)})"
+            )
 
     async def shutdown(self) -> None:
         """
