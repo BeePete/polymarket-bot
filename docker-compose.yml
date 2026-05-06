@@ -1,0 +1,41 @@
+# =============================================================================
+#  docker-compose.yml - Polymarket Bot
+# =============================================================================
+#  Uruchomienie: docker compose up -d --build
+#  Logi:         docker compose logs -f
+#  Zatrzymanie:  docker compose down
+#  Restart:      docker compose restart
+# =============================================================================
+
+services:
+  pmbot:
+    build: .
+    image: polymarket-bot:latest
+    container_name: polymarket-bot
+    restart: unless-stopped
+
+    # Volumes - dane przeżyją restart kontenera i przebudowanie obrazu.
+    # Po lewej: ścieżka NA SERWERZE; po prawej: ścieżka W KONTENERZE.
+    volumes:
+      # Config - tylko do odczytu z punktu widzenia kontenera nie chcemy,
+      # bo bot zapisuje zmienione progi/manual_events.
+      - ./config.yaml:/app/config.yaml
+      # Baza danych - bot_state.db w folderze ./data na hoście
+      - ./data:/app/data
+      # Logi
+      - ./logs:/app/logs
+
+    # Strefa czasowa - żeby godziny w logach i alertach były lokalne.
+    # Zmień jeśli serwer jest w innej strefie.
+    environment:
+      - TZ=Europe/Warsaw
+
+    # Limit pamięci - bot powinien zmieścić się w 200MB; daje bufor na 512MB.
+    mem_limit: 512m
+
+    # Logowanie - JSON logger Dockera z rotacją (osobno od loguru w pliku)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

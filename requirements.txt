@@ -1,0 +1,21 @@
+# HTTP klient (asynchroniczny) - do Gamma API
+aiohttp==3.10.10
+
+# WebSocket klient (asynchroniczny) - do CLOB WebSocket
+websockets==13.1
+
+# Telegram Bot API (asynchroniczny, najnowszy stable z asyncio)
+python-telegram-bot==21.6
+
+# Parsowanie config.yaml
+PyYAML==6.0.2
+
+# Ładny logging z rotacją plików
+loguru==0.7.2
+
+# Walidacja konfiguracji (modele typowane)
+pydantic==2.9.2
+
+# Dla testów
+pytest==8.3.3
+pytest-asyncio==0.24.0

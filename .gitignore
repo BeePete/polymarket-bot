@@ -1,0 +1,27 @@
+# Sekrety i konfiguracja lokalna - NIGDY nie commitować
+config.yaml
+.env
+
+# Baza danych i logi
+bot_state.db
+bot_state.db-journal
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Edytory / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

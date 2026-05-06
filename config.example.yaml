@@ -1,0 +1,87 @@
+# =============================================================================
+#  Konfiguracja bota Polymarket -> Telegram
+# =============================================================================
+#  Skopiuj ten plik do `config.yaml` i wpisz swoje wartości.
+#  PLIK config.yaml NIE JEST COMMITOWANY DO GITA (jest w .gitignore) - zawiera
+#  Twój sekretny token Telegrama, więc nie może wyciec.
+# =============================================================================
+
+telegram:
+  # Token bota od @BotFather (instrukcja w README, część 1)
+  bot_token: "WSTAW_TUTAJ_TOKEN_OD_BOTFATHER"
+
+  # Twój chat_id (instrukcja jak go znaleźć - w README, część 1, krok 5)
+  # Bot będzie przyjmował komendy TYLKO od tego chat_id.
+  chat_id: "WSTAW_TUTAJ_SWOJE_CHAT_ID"
+
+
+# Serie eventów do automatycznego monitorowania.
+# Bot codziennie sprawdzi Polymarket i znajdzie wszystkie aktywne eventy,
+# których "slug" (adres w URL) zaczyna się od podanego prefiksu.
+#
+# Przykład: prefiks "bitcoin-above" złapie eventy:
+#   - bitcoin-above-70000-on-may-7
+#   - bitcoin-above-72000-on-may-8
+auto_monitor_series:
+  - bitcoin-above
+  # - ethereum-above       # możesz odkomentować, dodać własne
+
+
+# Pojedyncze eventy dodane "ręcznie" (przez komendę /add lub edycję pliku).
+# Bot będzie je monitorował niezależnie od serii powyżej.
+manual_events: []
+
+
+# Progi alertów - wszystkie wartości w "shares" (jednostka rozmiaru zlecenia).
+# Można zmieniać też w runtime przez komendę /set_threshold.
+thresholds:
+  ask_melting_threshold: 30000      # alert A: suma asków poniżej tej liczby
+  ask_melting_burst_drop: 5000      # alert A: spadek o tyle ignoruje cooldown
+  market_buy_min_size: 5000         # alert B: minimalny rozmiar trade'u kupna
+  new_sell_order_min_size: 5000     # alert C: minimalny rozmiar nowego asku
+  big_limit_buy_min_size: 19000     # alert D: minimalny rozmiar nowego bida
+
+
+# Ceny do monitorowania (w ułamkach: 0.998 = 99.8¢, 0.999 = 99.9¢).
+monitored_prices:
+  - 0.998
+  - 0.999
+
+
+# Anty-spam: minimum sekund między dwoma alertami tego samego typu
+# dla tego samego rynku. (5 minut = 300 sekund)
+alert_cooldown_seconds: 300
+
+
+# Bot monitoruje TYLKO eventy zamykające się w ciągu tylu godzin.
+# (24 = sprawdzaj tylko eventy które kończą się w ciągu doby)
+monitor_hours_before_close: 24
+
+
+# Co ile sekund sprawdzać Polymarket w poszukiwaniu nowych eventów z serii.
+# (1800 = co 30 minut)
+discovery_interval_seconds: 1800
+
+
+# Co ile sekund re-skanować, czy któryś rynek wszedł/wyszedł ze strefy 99.9¢.
+# (Ten parametr nie wpływa na WebSocket, on i tak wysyła dane na bieżąco -
+#  to jest pomocniczy timer dla logiki.)
+rescan_interval_seconds: 30
+
+
+# =============================================================================
+#  Zaawansowane (nie ruszaj jeśli nie wiesz co robisz)
+# =============================================================================
+advanced:
+  # URLe API Polymarket - można zmienić jeśli kiedyś się zmienią
+  gamma_api_url: "https://gamma-api.polymarket.com"
+  clob_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+  # Ile aktywnych eventów pobierać naraz z Gamma API podczas discovery
+  gamma_fetch_limit: 500
+
+  # Maks. shares per token w trakcie subskrypcji - ochrona przed bugami
+  max_monitored_tokens: 200
+
+  # Poziom logowania: TRACE, DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"

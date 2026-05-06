@@ -1,0 +1,26 @@
+# Lokalny stan i sekrety - NIE wrzucamy do obrazu Dockera
+config.yaml
+.env
+bot_state.db
+bot_state.db-journal
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Git
+.git/
+.gitignore
+
+# Edytory
+.vscode/
+.idea/
+.DS_Store
+
+# Tests (kontener nie potrzebuje testów do działania)
+tests/
