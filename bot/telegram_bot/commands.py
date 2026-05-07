@@ -24,10 +24,11 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from ..alerts.formatter import format_test_alert
+from ..alerts.formatter import build_depth_messages, format_test_alert
 
 if TYPE_CHECKING:  # tylko do type-checkingu, unika circular imports
     from ..config import BotConfig
+    from ..polymarket.clob_ws import CLOBWebSocketManager
     from ..storage.db import Database
     from .bot import TelegramSender
 
@@ -36,6 +37,7 @@ HELP_TEXT = (
     "<b>Polymarket Bot - dostępne komendy:</b>\n\n"
     "/list — aktualnie monitorowane eventy i rynki\n"
     "/status — pełny status bota i statystyki\n"
+    "/depth — aktualna głębokość order booka dla rynków blisko 99,9¢\n"
     "/add &lt;slug&gt; — dodaj event do monitorowania\n"
     "/remove &lt;slug&gt; — usuń event\n"
     "/series — lista skonfigurowanych serii auto-monitorowania\n"
@@ -60,6 +62,7 @@ class CommandHandlers:
         config_path: str,
         db: "Database",
         sender: "TelegramSender",
+        ws: "CLOBWebSocketManager | None" = None,
         on_add_event=None,           # async callable(slug: str) -> bool
         on_remove_event=None,        # async callable(slug: str) -> bool
         get_runtime_stats=None,      # callable() -> dict (uptime, queues, ...)
@@ -68,6 +71,7 @@ class CommandHandlers:
         self.config_path = config_path
         self.db = db
         self.sender = sender
+        self.ws = ws
         self._on_add_event = on_add_event
         self._on_remove_event = on_remove_event
         self._get_runtime_stats = get_runtime_stats
@@ -238,6 +242,50 @@ class CommandHandlers:
             lines.append(f"• <code>{_html(s)}</code>")
         await self._send(update, "\n".join(lines))
 
+    async def cmd_depth(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+        """Pokazuje aktualną głębokość order booka dla rynków blisko 99,9¢."""
+        if not self._is_owner(update):
+            return await self._reject_unauthorized(update)
+
+        if self.ws is None:
+            await self._send(update, "❌ WebSocket niedostępny - bot się jeszcze startuje.")
+            return
+
+        # Eventy posortowane alfabetycznie po slug (deterministycznie)
+        events = sorted(self.db.list_events(), key=lambda e: e["slug"])
+
+        events_with_markets: list[tuple[dict, list[dict]]] = []
+        for ev in events:
+            event_dict = {
+                "slug": ev["slug"],
+                "title": ev["title"],
+            }
+            markets = self.db.list_markets_for_event(ev["slug"])
+            market_dicts = [
+                {
+                    "question": m["question"],
+                    "token_yes_id": m["token_yes_id"],
+                    "token_no_id": m["token_no_id"],
+                }
+                for m in markets
+            ]
+            events_with_markets.append((event_dict, market_dicts))
+
+        messages = build_depth_messages(
+            events_with_markets=events_with_markets,
+            book_lookup=self.ws.get_book,
+            monitored_prices=list(self.config.monitored_prices),
+        )
+
+        # Każda wiadomość osobno (Telegram nie łączy)
+        for msg in messages:
+            await self._send(update, msg)
+
+        logger.info(
+            f"Komenda /depth: wysłano {len(messages)} wiadomość(ci) "
+            f"({sum(len(m) for m in messages)} znaków łącznie)"
+        )
+
     async def cmd_thresholds(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         if not self._is_owner(update):
             return await self._reject_unauthorized(update)
@@ -318,6 +366,7 @@ class CommandHandlers:
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("list", self.cmd_list))
         app.add_handler(CommandHandler("status", self.cmd_status))
+        app.add_handler(CommandHandler("depth", self.cmd_depth))
         app.add_handler(CommandHandler("add", self.cmd_add))
         app.add_handler(CommandHandler("remove", self.cmd_remove))
         app.add_handler(CommandHandler("series", self.cmd_series))

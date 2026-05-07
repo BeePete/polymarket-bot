@@ -696,6 +696,7 @@ sudo systemctl restart ssh
 | `/help` | Lista komend |
 | `/list` | Aktualnie monitorowane eventy i rynki |
 | `/status` | Pełny status, statystyki alertów |
+| `/depth` | Aktualna głębokość order booka dla rynków blisko 99,9¢ |
 | `/add <slug>` | Dodaje event ręcznie (np. `/add bitcoin-above-on-may-7`) |
 | `/remove <slug>` | Usuwa event |
 | `/series` | Skonfigurowane serie auto-monitorowania |
@@ -705,13 +706,43 @@ sudo systemctl restart ssh
 | `/resume` | Wznawia |
 | `/test` | Wysyła testowy alert |
 
-### Przykłady
+### Przykład outputu `/depth`
+
+```
+📊 Stan głębokości — 14:23
+
+₿ Bitcoin Above ___ on May 7
+  $90,000 NO 99,9¢ — 30k
+  $86,000 NO 99,9¢ — 12k
+  $80,000 NO 99,8¢ — 5.5k
+
+Ξ Ethereum Above ___ on May 7
+  $3,500 NO 99,9¢ — 6k
+```
+
+Migawka pokazuje:
+- **Sekcję per event** (ikona zależna od slug-a, pełny tytuł z Gamma API)
+- **Linie per podrynek+strona** posortowane malejąco po wartości progu
+  (np. `$90,000` na górze, `$80,000` niżej)
+- **Sumę shares** na obu monitorowanych poziomach (99,8 + 99,9¢) po stronie
+  która jest "blisko 99,9¢"
+- **Cenę rynkową** = najlepszy ask z monitorowanych poziomów
+
+Pomijane (po cichu, bez crashy):
+- Strony rynku gdzie aktualna cena nie jest 99,8/99,9¢
+- Rynki gdzie WS jeszcze nie miał snapshotu (np. dopiero co zasubskrybowane)
+
+Jeśli treść przekracza limit Telegrama (4096 znaków), wiadomość jest
+automatycznie dzielona na kilka chunków z `(część X/Y)` w nagłówku.
+
+### Przykłady innych komend
 
 ```
 /add bitcoin-above-72000-on-may-8
 /set_threshold ask_melting_threshold 25000
 /pause
 /resume
+/depth
 ```
 
 ---

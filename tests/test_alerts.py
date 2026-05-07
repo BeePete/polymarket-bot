@@ -7,6 +7,8 @@ Uruchamianie:
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from bot.alerts.detector import Alert, Detector, DetectorThresholds
@@ -1648,3 +1650,289 @@ class TestE2EBufferIntegration:
         msgs_text = "\n----\n".join(sender.messages)
         assert "₿" in msgs_text
         assert "Ξ" in msgs_text
+
+
+# =============================================================================
+#  build_depth_messages - komenda /depth
+# =============================================================================
+
+
+from bot.alerts.formatter import build_depth_messages
+
+
+def _ev(slug: str, title: str = "") -> dict:
+    """Tworzy minimalny event_dict dla testów depth."""
+    return {"slug": slug, "title": title or slug}
+
+
+def _mk(question: str, token_yes: str = None, token_no: str = None) -> dict:
+    """Tworzy minimalny market_dict dla testów depth."""
+    return {
+        "question": question,
+        "token_yes_id": token_yes,
+        "token_no_id": token_no,
+    }
+
+
+def _ws_lookup(books: dict[str, OrderBook]):
+    """Zwraca callable book_lookup którego można użyć jako ws.get_book."""
+    return lambda token_id: books.get(token_id)
+
+
+class TestBuildDepthMessages:
+    """Pure function build_depth_messages - format wiadomości dla /depth."""
+
+    PRICES = [0.998, 0.999]
+
+    # ---------- 3 eventy = 3 sekcje ----------
+
+    def test_3_eventy_3_sekcje(self):
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "Bitcoin Above ___ on May 7"),
+             [_mk("Bitcoin reach $86,000", token_no="TBTC_NO")]),
+            (_ev("ethereum-may-7", "Ethereum Above ___ on May 7"),
+             [_mk("Ethereum reach $3,500", token_no="TETH_NO")]),
+            (_ev("sp-500-may-7", "S&P Above ___ on May 7"),
+             [_mk("S&P above 5500", token_no="TSP_NO")]),
+        ]
+        books = {
+            "TBTC_NO": book(asks=[(0.999, 12000), (0.998, 8000)]),
+            "TETH_NO": book(asks=[(0.999, 6000)]),
+            "TSP_NO": book(asks=[(0.998, 15000)]),
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+            now=datetime(2026, 5, 7, 14, 23),
+        )
+        assert len(msgs) == 1
+        msg = msgs[0]
+        # Trzy sekcje - po jednej per event
+        assert msg.count("Bitcoin Above") == 1
+        assert msg.count("Ethereum Above") == 1
+        assert msg.count("S&amp;P Above") == 1   # HTML escape
+        # Trzy ikony (po jednej na sekcję)
+        assert msg.count("₿") == 1
+        assert msg.count("Ξ") == 1
+        assert msg.count("📈") == 1
+
+    # ---------- pusta lista / brak rynków ----------
+
+    def test_brak_eventow(self):
+        msgs = build_depth_messages([], _ws_lookup({}), self.PRICES)
+        assert msgs == ["📊 Brak rynków blisko 99,9¢ w tej chwili"]
+
+    def test_eventy_sa_ale_zaden_blisko_999(self):
+        # Event z rynkiem, ale book ma asks tylko na 0.95 (NIE blisko 99,9¢)
+        events_with_markets = [
+            (_ev("bitcoin-may-7"),
+             [_mk("Bitcoin $86,000", token_no="TBTC_NO")]),
+        ]
+        books = {"TBTC_NO": book(asks=[(0.95, 5000)])}
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        assert msgs == ["📊 Brak rynków blisko 99,9¢ w tej chwili"]
+
+    # ---------- format pojedynczej linii ----------
+
+    def test_format_linii_pojedynczej(self):
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "Bitcoin Above ___ on May 7"),
+             [_mk("Will Bitcoin reach $86,000 on May 7", token_no="TBTC_NO")]),
+        ]
+        books = {
+            # Suma 8000 + 4000 = 12000 = "12k" w format_shares
+            "TBTC_NO": book(asks=[(0.998, 8000), (0.999, 4000)]),
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+            now=datetime(2026, 5, 7, 14, 23),
+        )
+        msg = msgs[0]
+        # Linia formatu: "  $86,000 NO 99,8¢ — 12k"
+        # (best_monitored_price = 0.998 bo to najniższy ask wśród monitored)
+        assert "$86,000 NO 99,8¢ — 12k" in msg
+
+    def test_godzina_w_naglowku(self):
+        events_with_markets = [
+            (_ev("bitcoin-may-7"),
+             [_mk("$86,000", token_no="TBTC_NO")]),
+        ]
+        books = {"TBTC_NO": book(asks=[(0.999, 5000)])}
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+            now=datetime(2026, 5, 7, 14, 23, 45),
+        )
+        # Tylko HH:MM (bez sekund)
+        assert "Stan głębokości — 14:23" in msgs[0]
+        assert "14:23:45" not in msgs[0]
+
+    # ---------- sortowanie ----------
+
+    def test_sortowanie_podrynkow_malejaco_po_progu(self):
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC Event"), [
+                _mk("Bitcoin above $80,000", token_no="T80"),
+                _mk("Bitcoin above $90,000", token_no="T90"),
+                _mk("Bitcoin above $86,000", token_no="T86"),
+            ]),
+        ]
+        books = {
+            "T80": book(asks=[(0.999, 1000)]),
+            "T90": book(asks=[(0.999, 2000)]),
+            "T86": book(asks=[(0.999, 3000)]),
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        msg = msgs[0]
+        # Kolejność w stringu: $90,000 najpierw, potem $86,000, potem $80,000
+        idx_90 = msg.find("$90,000")
+        idx_86 = msg.find("$86,000")
+        idx_80 = msg.find("$80,000")
+        assert idx_90 < idx_86 < idx_80
+
+    def test_yes_przed_no_przy_tie(self):
+        # Ten sam rynek po obu stronach - tie-breaker: YES przed NO
+        events_with_markets = [
+            (_ev("bitcoin-may-7"), [
+                _mk("Bitcoin reach $86,000",
+                    token_yes="TBTC_YES", token_no="TBTC_NO"),
+            ]),
+        ]
+        # Oba tokeny mają asks w monitored_prices
+        books = {
+            "TBTC_YES": book(asks=[(0.999, 5000)]),
+            "TBTC_NO": book(asks=[(0.999, 3000)]),
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        msg = msgs[0]
+        idx_yes = msg.find("$86,000 YES")
+        idx_no = msg.find("$86,000 NO")
+        assert idx_yes < idx_no
+
+    # ---------- skipowanie order booków bez danych ----------
+
+    def test_book_lookup_zwraca_None_pomijane(self):
+        """Order book niedostępny (None) - linia pomijana po cichu."""
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC"), [
+                _mk("Bitcoin $86,000", token_no="TBTC_86"),  # MA book
+                _mk("Bitcoin $90,000", token_no="TBTC_90"),  # BRAK book
+            ]),
+        ]
+        books = {"TBTC_86": book(asks=[(0.999, 5000)])}  # tylko 86k
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        msg = msgs[0]
+        assert "$86,000" in msg
+        assert "$90,000" not in msg
+        # Sekcja istnieje (1 linia), nie crash
+
+    def test_strona_pomijana_jesli_token_None(self):
+        # Market z tylko jednym token_id (drugi None) - strona z None pomijana
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC"), [
+                _mk("Bitcoin $86,000", token_yes=None, token_no="TBTC_NO"),
+            ]),
+        ]
+        books = {"TBTC_NO": book(asks=[(0.999, 5000)])}
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        # Tylko 1 linia (NO), brak crashy na YES=None
+        assert "NO 99,9¢" in msgs[0]
+
+    def test_book_z_askami_poza_monitored_pomijany(self):
+        """Book z askami tylko na 0.95 (nie monitored_prices) - linia pomijana."""
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC"), [
+                _mk("Bitcoin $86,000", token_no="T86"),    # blisko 99,9¢
+                _mk("Bitcoin $50,000", token_no="T50"),    # daleko (0.95)
+            ]),
+        ]
+        books = {
+            "T86": book(asks=[(0.999, 5000)]),
+            "T50": book(asks=[(0.95, 5000)]),  # NIE monitored
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        msg = msgs[0]
+        assert "$86,000" in msg
+        assert "$50,000" not in msg
+
+    # ---------- chunkowanie >4000 znaków ----------
+
+    def test_dlugi_content_dzielony_na_wiadomosci(self):
+        """Symuluje 100 eventów po 1 markecie - musimy podzielić na chunki."""
+        events_with_markets = []
+        books = {}
+        for i in range(100):
+            slug = f"bitcoin-event-{i:03d}"
+            tok = f"TOK{i}"
+            events_with_markets.append((
+                _ev(slug, f"Bitcoin Event Number {i:03d}"),
+                [_mk(f"Bitcoin reach ${i:03d},000", token_no=tok)],
+            ))
+            books[tok] = book(asks=[(0.999, 5000)])
+
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+            now=datetime(2026, 5, 7, 14, 23),
+            max_chars=2000,  # mały limit żeby wymusić podział
+        )
+        # Wiele wiadomości
+        assert len(msgs) > 1
+        # Każda < limitu
+        for m in msgs:
+            assert len(m) <= 2000
+        # Każda ma nagłówek z (część X/Y)
+        total = len(msgs)
+        for i, m in enumerate(msgs, start=1):
+            assert f"(część {i}/{total})" in m
+        # Łącznie wszystkie 100 eventów reprezentowane
+        all_text = "".join(msgs)
+        for i in range(100):
+            assert f"bitcoin-event-{i:03d}" in all_text or \
+                   f"Bitcoin Event Number {i:03d}" in all_text
+
+    def test_pojedyncza_wiadomosc_bez_numeru_czesci(self):
+        """Krótki content - 1 wiadomość, nagłówek BEZ '(część X/Y)'."""
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC Event"),
+             [_mk("$86,000", token_no="T")]),
+        ]
+        books = {"T": book(asks=[(0.999, 5000)])}
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        assert len(msgs) == 1
+        assert "(część" not in msgs[0]
+
+    # ---------- format_shares użyty dla wartości ----------
+
+    def test_uzywa_format_shares(self):
+        # 12345 -> "12k", 5500 -> "5.5k", 250 -> "250"
+        events_with_markets = [
+            (_ev("bitcoin-may-7", "BTC"), [
+                _mk("$86,000", token_no="T_BIG"),
+                _mk("$80,000", token_no="T_MID"),
+                _mk("$70,000", token_no="T_SMALL"),
+            ]),
+        ]
+        books = {
+            "T_BIG": book(asks=[(0.999, 12345)]),
+            "T_MID": book(asks=[(0.999, 5500)]),
+            "T_SMALL": book(asks=[(0.999, 250)]),
+        }
+        msgs = build_depth_messages(
+            events_with_markets, _ws_lookup(books), self.PRICES,
+        )
+        msg = msgs[0]
+        assert "— 12k" in msg
+        assert "— 5.5k" in msg
+        assert "— 250" in msg

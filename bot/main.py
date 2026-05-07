@@ -526,6 +526,7 @@ async def main_async() -> None:
         config_path=str(CONFIG_PATH),
         db=db,
         sender=sender,
+        ws=ws,
         on_add_event=lambda slug: add_event_callback(
             config, db, ws, CONFIG_PATH, slug
         ),

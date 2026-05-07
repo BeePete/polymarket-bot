@@ -305,3 +305,188 @@ def format_test_alert() -> str:
         "Bot żyje i może pisać do tego chatu.\n"
         f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')}"
     )
+
+
+# =============================================================================
+#  Komenda /depth - aktualna głębokość order booka per rynek
+# =============================================================================
+#  Pure functions - przyjmują dane wejściowe, zwracają stringi HTML.
+#  Bez I/O i bez stanu - łatwe do testowania.
+# =============================================================================
+
+
+from typing import Callable
+
+from ..polymarket.models import OrderBook
+
+
+# Maksymalna długość pojedynczej wiadomości Telegrama. Limit techniczny
+# wynosi 4096; dajemy margin na nagłówek i HTML escape.
+DEPTH_MAX_MESSAGE_CHARS = 4000
+
+
+def _depth_line(
+    market: dict,
+    side: str,
+    book: OrderBook,
+    monitored_prices: list[float],
+) -> str | None:
+    """
+    Buduje pojedynczą linię '/depth' dla rynku po danej stronie, lub None
+    jeśli ta strona nie jest blisko 99,8/99,9¢ (czyli żaden ask na tej
+    stronie nie ma ceny w monitored_prices).
+
+    Format: '  $86,000 NO 99,9¢ — 5.5k'
+    """
+    monitored_set = {round(p, 6) for p in monitored_prices}
+
+    # Najlepszy ask którego cena jest w monitored_prices.
+    # Jeśli nie ma żadnego - ta strona nie jest blisko 99,9¢, pomiń.
+    best_monitored_price: float | None = None
+    for lvl in book.asks:
+        if round(lvl.price, 6) in monitored_set:
+            if best_monitored_price is None or lvl.price < best_monitored_price:
+                best_monitored_price = lvl.price
+    if best_monitored_price is None:
+        return None
+
+    # Suma asków na monitored_prices (np. 99,8 + 99,9¢ łącznie)
+    total = book.total_ask_size_at_prices(monitored_prices)
+    if total <= 0:
+        return None
+
+    short = _escape_html(market_short(market.get("question") or "?"))
+    return (
+        f"  {short} {side} {_fmt_price_pl(best_monitored_price)}¢ "
+        f"— {format_shares(total)}"
+    )
+
+
+def _depth_event_section(
+    event: dict,
+    markets: list[dict],
+    book_lookup: Callable[[str], OrderBook | None],
+    monitored_prices: list[float],
+) -> str | None:
+    """
+    Buduje sekcję dla jednego eventu (nagłówek + linie podrynków).
+    Zwraca None jeśli żaden podrynek/strona nie jest blisko 99,9¢.
+
+    Sortowanie linii: malejąco po wartości progu (`market_sort_key`),
+    tie-breaker: YES przed NO.
+    """
+    icon = series_icon(event.get("slug", "") or "")
+    title = _escape_html(event.get("title") or event.get("slug") or "?")
+
+    rows: list[tuple[tuple, str]] = []  # (sort_key, line_text)
+    for market in markets:
+        for side, token_key in (("YES", "token_yes_id"), ("NO", "token_no_id")):
+            token_id = market.get(token_key)
+            if not token_id:
+                continue
+            book = book_lookup(token_id)
+            if book is None:
+                continue
+            line = _depth_line(market, side, book, monitored_prices)
+            if line is None:
+                continue
+            sort_key = (
+                market_sort_key(market.get("question") or ""),
+                0 if side == "YES" else 1,    # YES przed NO przy tie
+            )
+            rows.append((sort_key, line))
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: r[0])
+    return "\n".join([f"{icon} <b>{title}</b>"] + [r[1] for r in rows])
+
+
+def _depth_chunk(sections: list[str], header: str) -> str:
+    """Składa nagłówek + sekcje rozdzielone pustymi liniami."""
+    return header + "\n\n" + "\n\n".join(sections)
+
+
+def build_depth_messages(
+    events_with_markets: list[tuple[dict, list[dict]]],
+    book_lookup: Callable[[str], OrderBook | None],
+    monitored_prices: list[float],
+    now: datetime | None = None,
+    max_chars: int = DEPTH_MAX_MESSAGE_CHARS,
+) -> list[str]:
+    """
+    Buduje 1+ wiadomości HTML dla komendy /depth.
+
+    Args:
+      events_with_markets: lista (event_dict, list[market_dict])
+        event_dict wymagane pola: 'slug', 'title'
+        market_dict wymagane pola: 'question', 'token_yes_id', 'token_no_id'
+      book_lookup: callable(token_id) -> OrderBook | None
+        zwraca aktualny order book dla tokenu (np. ws.get_book)
+        None gdy WS jeszcze nie miał snapshotu - linia pomijana po cichu
+      monitored_prices: ceny do sumowania, np. [0.998, 0.999]
+      now: czas wysłania (do nagłówka). Domyślnie - teraz.
+      max_chars: limit na pojedynczą wiadomość Telegrama (4000 = margin
+        pod 4096 limit Telegrama, na nagłówek i HTML escape).
+
+    Returns:
+      Lista 1+ wiadomości HTML:
+      - 1 wiadomość "📊 Brak rynków..." jeśli żaden rynek nie jest blisko 99,9¢
+      - 1 wiadomość jeśli całość mieści się w max_chars
+      - 2+ wiadomości z nagłówkiem "📊 Stan głębokości — HH:MM (część X/Y)"
+        jeśli treść przekracza limit. Dzielenie odbywa się na granicy sekcji
+        (event), żeby nie rozbijać sekcji w połowie.
+
+    Sortowanie:
+      - eventy: spec mówi "alfabetycznie po slug" - kolejność z events_with_markets
+        jest zachowana (caller sortuje przed wywołaniem)
+      - linie wewnątrz eventu: malejąco po wartości progu, YES przed NO
+    """
+    now = now or datetime.now(timezone.utc).astimezone()
+    time_str = now.strftime("%H:%M")
+
+    # Buduj sekcje per event
+    sections: list[str] = []
+    for event, markets in events_with_markets:
+        section = _depth_event_section(event, markets, book_lookup, monitored_prices)
+        if section:
+            sections.append(section)
+
+    if not sections:
+        return ["📊 Brak rynków blisko 99,9¢ w tej chwili"]
+
+    # Spróbuj jednej wiadomości
+    single_header = f"📊 <b>Stan głębokości — {time_str}</b>"
+    one_message = _depth_chunk(sections, single_header)
+    if len(one_message) <= max_chars:
+        return [one_message]
+
+    # Trzeba podzielić na chunki - greedy fill, granica = sekcja (event).
+    # "Część X/Y" w nagłówku może mieć max ~8 znaków extra ("(część 99/99)" = 13)
+    header_overhead = 80  # hojna estymata na nagłówek z numerem części
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for section in sections:
+        # +2 za "\n\n" separator między sekcjami w chunk-u
+        section_with_sep = len(section) + 2
+        if current and (current_len + section_with_sep + header_overhead > max_chars):
+            chunks.append(current)
+            current = [section]
+            current_len = len(section)
+        else:
+            current.append(section)
+            current_len += section_with_sep if current else len(section)
+    if current:
+        chunks.append(current)
+
+    total_parts = len(chunks)
+    messages = []
+    for i, chunk_sections in enumerate(chunks, start=1):
+        header = (
+            f"📊 <b>Stan głębokości — {time_str} "
+            f"(część {i}/{total_parts})</b>"
+        )
+        messages.append(_depth_chunk(chunk_sections, header))
+    return messages

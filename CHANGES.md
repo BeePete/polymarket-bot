@@ -1,5 +1,109 @@
 # Historia zmian
 
+## 2026-05-07 — Komenda `/depth` (głębokość order booka per rynek)
+
+### Cel zmian
+
+Po monitorowaniu kilku eventów pojawiła się potrzeba szybkiego "rzutu oka"
+na aktualny stan głębokości — żeby wiedzieć ile shares jeszcze "siedzi"
+na asku 99,8/99,9¢ na każdym aktywnym podrynku, bez czekania aż wpadnie
+alert. Komenda `/depth` daje migawkę całego stanu na jednej (lub kilku)
+wiadomościach.
+
+### Format wiadomości
+
+```
+📊 Stan głębokości — 14:23
+
+₿ Bitcoin Above ___ on May 7
+  $90,000 NO 99,9¢ — 30k
+  $86,000 NO 99,9¢ — 12k
+  $80,000 NO 99,8¢ — 5.5k
+
+Ξ Ethereum Above ___ on May 7
+  $3,500 NO 99,9¢ — 6k
+```
+
+Reguły:
+- Eventy **alfabetycznie po slug** (deterministyczna kolejność)
+- Wewnątrz eventu **malejąco po wartości progu** (`market_sort_key`,
+  ten sam co dla konsolidacji), tie-breaker **YES przed NO**
+- Pomijamy strony bez asku w `monitored_prices` (czyli niemonitorowane)
+- Pomijamy rynki gdzie order book = `None` (WS się jeszcze ładuje)
+- Limit Telegrama 4096 znaków → dzielimy na chunki z `(część X/Y)`
+  w nagłówku
+- Brak monitorowanych rynków → `📊 Brak rynków blisko 99,9¢ w tej chwili`
+
+### Co zostało zmienione
+
+#### `bot/alerts/formatter.py` — nowa pure function
+
+- `build_depth_messages(events_with_markets, book_lookup, monitored_prices,
+   now, max_chars=4000) -> list[str]`
+- 3 prywatne helpery: `_depth_line`, `_depth_event_section`, `_depth_chunk`
+- Stała `DEPTH_MAX_MESSAGE_CHARS = 4000` (margin pod limit Telegrama 4096)
+
+Funkcja jest pure — przyjmuje `book_lookup` jako callable, więc nie
+wymaga referencji do WS. Dzięki temu testy nie potrzebują mockować
+całej infrastruktury — wystarczy `dict[token_id, OrderBook]`.
+
+#### `bot/telegram_bot/commands.py` — nowa komenda + zależność `ws`
+
+- `CommandHandlers.__init__` przyjmuje teraz `ws: CLOBWebSocketManager | None`
+  (opcjonalny — jeśli `None`, `/depth` zwraca komunikat, że WS niedostępny)
+- Nowa metoda `cmd_depth(update, ctx)` — zbiera eventy z DB, woła
+  `build_depth_messages(...)`, wysyła każdą wiadomość osobno
+- `register()` dorzuca `CommandHandler("depth", self.cmd_depth)`
+- `HELP_TEXT` rozszerzony o linię `/depth — aktualna głębokość...`
+
+#### `bot/main.py` — przekazanie `ws` do `CommandHandlers`
+
+Jedna linia: `ws=ws` w wywołaniu `CommandHandlers(...)`.
+
+### Testy
+
+Nowych testów: **+13** (od 121 → 134), wszystkie zielone.
+
+Klasa `TestBuildDepthMessages`:
+- 3 eventy → 3 sekcje (z różnymi ikonami serii)
+- Brak eventów / żaden rynek nie blisko 99,9¢ → komunikat fallback
+- Format linii (`$86,000 NO 99,8¢ — 12k`)
+- Godzina w nagłówku w `HH:MM` (bez sekund)
+- Sortowanie podrynków malejąco po progu
+- Tie-breaker YES przed NO przy tej samej kwocie
+- `book_lookup` zwraca `None` → linia pominięta po cichu
+- `token_yes_id=None` (jedna strona brakująca) → strona pominięta
+- Asks tylko poza monitored_prices → linia pominięta
+- 100 eventów z `max_chars=2000` → wiele wiadomości z `(część X/Y)`
+- Pojedyncza krótka wiadomość → BEZ numeru części
+- `format_shares` używany dla wszystkich liczb (`12k`, `5.5k`, `250`)
+
+### Edytowane pliki
+
+```
+bot/alerts/formatter.py             (+170 linii — build_depth_messages + helpers)
+bot/telegram_bot/commands.py        (+50 — cmd_depth + ws + HELP)
+bot/main.py                         (+1 — ws=ws przy CommandHandlers)
+tests/test_alerts.py                (+200 — TestBuildDepthMessages, 13 testów)
+README.md                           (+sekcja /depth z przykładem)
+CHANGES.md                          (ten wpis)
+```
+
+### Backward compatibility
+
+- `CommandHandlers(ws=None)` jest opcjonalny — stare wywołania bez `ws`
+  działają (ale `/depth` zwraca wtedy "WebSocket niedostępny").
+- Inne komendy (`/list`, `/status` itd.) nie używają `ws`, są nietknięte.
+
+### Performance
+
+`/depth` iteruje po wszystkich eventach w DB (zwykle <10) i odczytuje
+order book z pamięci (`O(1)` per token). Generowanie wiadomości jest
+synchroniczne i kończy się w <100ms nawet dla setek rynków. Wysłanie
+przez Telegram to osobny await — kilkaset ms na chunk.
+
+---
+
 ## 2026-05-06 — Filtr "bid support" (wycisza alerty bez wsparcia w księdze)
 
 ### Cel zmian
